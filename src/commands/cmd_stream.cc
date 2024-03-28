@@ -1065,7 +1065,7 @@ class CommandXRead : public Commander,
     bufferevent_enable(bev, EV_READ);
   }
 
- private:
+ protected:
   std::vector<std::string> streams_;
   std::vector<StreamEntryID> ids_;
   std::vector<bool> latest_marks_;
