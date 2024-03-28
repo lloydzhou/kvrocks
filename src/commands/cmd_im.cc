@@ -378,6 +378,120 @@ class CommandIMMessage : public Commander {
   StreamEntryID end_;
 };
 
+class CommandIMGroup : public CommandIMGroupSend {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    // im.group group_id
+    // im.group group_id user_id field value
+    to_group_id_ = args[1];
+    if (args.size() > 2) {
+      user_id_ = args[2];
+      if (args.size() % 2 != 1) {
+        return {Status::RedisParseErr, errWrongNumOfArguments};
+      }
+      for (size_t i = 3; i < args_.size(); i += 2) {
+        field_values_.emplace_back(args_[i], args_[i + 1]);
+      }
+    }
+    return Commander::Parse(args);
+  }
+
+  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+    uint64_t ret = 0;
+    std::string m_group_id;
+    std::string i_group_id;
+    m_group_id.append("gm:");
+    m_group_id.append(to_group_id_);
+    i_group_id.append("gi:");
+    i_group_id.append(to_group_id_);
+    redis::Hash hash_db(srv->storage, conn->GetNamespace());
+    redis::ZSet zset_db(srv->storage, conn->GetNamespace());
+    redis::Set set_db(srv->storage, conn->GetNamespace());
+    if (args_.size() > 2) {
+      field_values_.emplace_back("master", user_id_);
+      // HMSET i_group_id master user_id unpack(ARGV)
+      auto s = hash_db.MSet(i_group_id, field_values_, true, &ret);
+      if (!s.ok()) {
+        return {Status::RedisExecErr, s.ToString()};
+      }
+
+      *output = redis::Integer(ret);
+      // ZADD c_user_id timestamp to_group_id
+      {
+        float score = (float)util::GetTimeStampMS();
+        ZAddFlags flags_{0};
+        std::string c_user_id;
+        std::vector<MemberScore> member_scores_;
+
+        c_user_id.append("c:");
+        c_user_id.append(user_id_);
+        member_scores_.emplace_back(MemberScore{to_group_id_, score});
+        auto s = zset_db.Add(c_user_id, flags_, &member_scores_, &ret);
+        if (!s.ok()) {
+          return {Status::RedisExecErr, s.ToString()};
+        }
+        srv->WakeupBlockingConns(c_user_id, member_scores_.size());
+      }
+      // SADD m_group_id user_id
+      {
+        uint64_t ret = 0;
+        std::vector<Slice> members;
+        members.emplace_back(user_id_);
+        auto s = set_db.Add(m_group_id, members, &ret);
+        if (!s.ok()) {
+          return {Status::RedisExecErr, s.ToString()};
+        }
+      }
+      // send join group message(only for current_user)
+      std::vector<std::string> name_value_pairs_;
+      name_value_pairs_.push_back("action");
+      name_value_pairs_.push_back("join");
+      name_value_pairs_.push_back("uid");
+      name_value_pairs_.push_back(user_id_);
+      name_value_pairs_.push_back("gid");
+      name_value_pairs_.push_back(to_group_id_);
+      auto status = ExecuteSend(srv, conn, output);
+      if (status) {
+        *output = redis::Integer(ret);
+      }
+      return status;
+    } else {
+      // HGETALL i_group_id
+      std::vector<FieldValue> field_values;
+      {
+        auto s = hash_db.GetAll(i_group_id, &field_values);
+        if (!s.ok()) {
+          return {Status::RedisExecErr, s.ToString()};
+        }
+      }
+      // SMSMBERS m_group_id
+      std::vector<std::string> members;
+      std::string m_group_id;
+      m_group_id.append("gm:");
+      m_group_id.append(to_group_id_);
+      {
+        auto s = set_db.Members(m_group_id, &members);
+        if (!s.ok()) {
+          return {Status::RedisExecErr, s.ToString()};
+        }
+      }
+      // output
+      std::vector<std::string> kv_pairs;
+      kv_pairs.reserve(field_values.size());
+      for (const auto &p : field_values) {
+        kv_pairs.emplace_back(p.field);
+        kv_pairs.emplace_back(p.value);
+      }
+      output->append(redis::MultiLen(2));
+      output->append(conn->MapOfBulkStrings(kv_pairs));
+      output->append(conn->SetOfBulkStrings(members));
+      return Status::OK();
+    }
+  }
+ private:
+  std::vector<FieldValue> field_values_;
+};
+
 class CommandIMJoin : public CommandIMGroupSend {
  public:
   Status Parse(const std::vector<std::string> &args) override {
@@ -502,7 +616,6 @@ class CommandIMQuit : public CommandIMGroupSend {
     return status;
   }
 };
-
 
 class CommandIMUser : public Commander {
  public:
@@ -645,6 +758,7 @@ REDIS_REGISTER_COMMANDS(
   MakeCmdAttr<CommandIMSend>("im.send", -3, "write", 1, 1, 1),
   MakeCmdAttr<CommandIMGroupSend>("im.gsend", -3, "write", 1, 1, 1),
   MakeCmdAttr<CommandIMMessage>("im.message", 4, "read-only", 1, 1, 1),
+  MakeCmdAttr<CommandIMGroup>("im.group", -2, "write", 1, 1, 1),
   MakeCmdAttr<CommandIMJoin>("im.join", 3, "write", 1, 1, 1),
   MakeCmdAttr<CommandIMQuit>("im.quit", 3, "write", 1, 1, 1),
   MakeCmdAttr<CommandIMUser>("im.user", -2, "write", 1, 1, 1),
